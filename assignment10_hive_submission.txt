@@ -1,0 +1,412 @@
+----HIVE ASSIGNMENT
+----SUBMITTED BY RUPA KADAMBI
+
+-- IMPORTANT: BEFORE CREATING ANY TABLE, MAKE SURE YOU RUN THIS COMMAND 
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+SET hive.exec.max.dynamic.partitions = 1000000;
+set hive.exec.max.dynamic.partitions.pernode=1000000;
+
+--------------------------------------------------------------------------------------------------------------
+--                                             PRELIMINARY STEPS - DATA IMPORTS                              -
+--------------------------------------------------------------------------------------------------------------
+
+--CREATE TABLE IN THE COMMON FOLDER WITH THE DESIRED DATA STRUCTURE PER DATA DICTIONARY
+
+CREATE EXTERNAL TABLE IF NOT EXISTS rkad_nyc_taxi_rawdata (vendorid int, pickup_datetime string, 
+dropoff_datetime string, passenger_count int, trip_distance double,rate_code int, 
+store_forward_flag string, pickup_location int, dropoff_location int, payment_type int, 
+fare_charge double, extra_charge double,  mta_tax_charge double, tip_amount double, tolls_charge double, 
+improvement_surcharge double, total_charge double )
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION '/common_folder/nyc_taxi_data/'
+tblproperties ("skip.header.line.count"="2");
+
+LOAD DATA INPATH '/common_folder/nyc_taxi_data/yellow_tripdata_2017-11.csv'
+ OVERWRITE INTO TABLE rkad_nyc_taxi_rawdata;
+LOAD DATA INPATH '/common_folder/nyc_taxi_data/yellow_tripdata_2017-12.csv'
+ OVERWRITE INTO TABLE rkad_nyc_taxi_rawdata;
+ 
+--------------------------------------------------------------------------------------------------------------
+--                                    PRELIMINARY STEPS - DATA PREPARATION & EDA                             -             
+--------------------------------------------------------------------------------------------------------------
+
+---------------------------------------------TOTAL RECORD COUNT-----------------------------------------------
+select count(*) as total_records from rkad_nyc_taxi_rawdata ;
+
+------QUERY RESULT : 18793079
+
+-----------------------------------QUESTION 1: RECORD COUNT BY PROVIDER/VENDOR--------------------------------
+
+select vendorid , count(*) as nbr_records
+from rkad_nyc_taxi_rawdata
+group by vendorid
+order by vendorid;
+
+----- QUERY RESULT------|
+-- PROVIDER/|  COUNT     |
+    VENDOR  |            |  
+------------|------------|
+--   1      |  8447149   | 
+------------|------------|       
+--   2      | 10345930   |
+------------|------------|
+
+--------------------------------QUESTION 2 : DATA QUALITY CHECKS-----------------------------------------------
+
+----CHECK DATA INTEGRITY ON ALL FIELDS, PER THE DEFINITION IN THE DATA DICTIONARY
+
+----PICK UP AND DROP TIMES : FLAG RECORDS WHOSE DATES ARE NOT IN RANGE OR IF PICKUP TIME IS GREATER THAN DROP
+
+select count(*) as bad_records, 'DROP-OFF DATE OUT OF RANGE' as reject_reason from rkad_nyc_taxi_rawdata
+where (year(dropoff_datetime) != 2017 or month(dropoff_datetime) not in (11,12));
+
+select count(*) as bad_records, 'PICK UP DATE OUT OF RANGE' as reject_reason from rkad_nyc_taxi_rawdata
+where (year(pickup_datetime) != 2017 or month(pickup_datetime) not in (11,12));
+
+select count(*) as bad_records, 'DROP OFF DATE EARLIER THAN PICK UP DATE' as reject_reason 
+from rkad_nyc_taxi_rawdata
+where unix_timestamp(pickup_datetime) >= unix_timestamp(dropoff_datetime);
+
+------FOR PASSENGER COUNT, FLAG RECORDS WITH ZERO CUSTOMERS OR CUSTOMERS GREATER THAN 6
+
+select count(*) as bad_records, 'INVALID PASSENGER COUNT' as reject_reason from rkad_nyc_taxi_rawdata
+where passenger_count < 1 or passenger_count > 6;
+
+----------FLAG RECORDS WITH TRIP DISTANCE GREATER THAN 60 MILES
+
+select count(*) as bad_records, 'TRIP DISTANCE OUT OF RANGE' as reject_reason from rkad_nyc_taxi_rawdata
+where trip_distance <=0 or trip_distance > 60;
+
+--------------FLAG RATE CODES THAT ARE NOT IN THE DATA DICTIONARY
+
+select count(*) as bad_records, 'INVALID RATE CODE' as reject_reason from rkad_nyc_taxi_rawdata
+where rate_code not in (1,2,3,4,5,6);
+
+--------------------FLAG CHARGES WITH VERY HIGH OR NEGATIVE VALUES
+
+select count(*) as bad_records, 'FARE RATE TOO HIGH/LOW' as reject_reason from rkad_nyc_taxi_rawdata
+where fare_charge < 0 or fare_charge > 1000;
+
+select count(*) as bad_records, 'INVALID EXTRA CHARGE' as reject_reason from rkad_nyc_taxi_rawdata
+where extra_charge < 0 ;
+
+select count(*) as bad_records, 'INVALID MTA TAX' as reject_reason from rkad_nyc_taxi_rawdata
+where mta_tax_charge < 0 ;
+
+select count(*) as bad_records, 'INVALID TIP AMOUNT' as reject_reason from rkad_nyc_taxi_rawdata
+where tip_amount < 0 ;
+
+select count(*) as bad_records, 'INVALID TOLLS PAID' as reject_reason from rkad_nyc_taxi_rawdata
+where tolls_charge < 0;
+
+select count(*) as bad_records, 'INVALID TOTAL CHARGE' as reject_reason from rkad_nyc_taxi_rawdata
+where total_charge < 0;
+
+----RESULTS OF THE QUERIES ABOVE ARE INDICATED BELOW. THESE RECORDS WILL BE EXCLUDED PRIOR TO PARTITIONING
+
+---------|-----------------------------------------|
+--COUNT  | DATA QUALITY ISSUE                      |
+---------|-----------------------------------------|
+--18421	 | DROP OFF DATE EARLIER THAN PICK UP DATE |
+---------|-----------------------------------------|                                      
+--120328 | TRIP DISTANCE OUT OF RANGE              |
+---------|-----------------------------------------|
+--1907	 | DROP-OFF DATE OUT OF RANGE              |
+---------|-----------------------------------------|
+--315	 | PICK UP DATE OUT OF RANGE               |
+---------|-----------------------------------------|
+--109162 | INVALID PASSENGER COUNT                 |
+---------|-----------------------------------------|
+--9381   | FARE RATE TOO HIGH/LOW                  |
+---------|-----------------------------------------|
+--4835	 | INVALID EXTRA CHARGE                    |
+---------|-----------------------------------------|
+--9372	 | INVALID TOTAL CHARGE                    |
+---------|-----------------------------------------|
+--178	 | INVALID RATE CODE                       |
+---------|-----------------------------------------|
+--97 	 | INVALID TIP AMOUNT                      |
+---------|-----------------------------------------|
+--41	 | INVALID TOLLS PAID                      |
+---------|-----------------------------------------|
+--9092	 | INVALID MTA TAX                         |
+---------|-----------------------------------------|
+
+--------------------------------QUESTION 3 : VENDOR PERFORMANCE-----------------------------------------------
+
+-----FIND ALL BAD DATA RECORDS AND SUMMARISE BY VENDOR ID
+
+select vendorid, count(*) as record_cnt
+from rkad_nyc_taxi_rawdata
+where (year(dropoff_datetime) != 2017 or month(dropoff_datetime) not in (11,12)) 
+      or (year(pickup_datetime) != 2017 or month(pickup_datetime) not in (11,12))
+	  or unix_timestamp(pickup_datetime) >= unix_timestamp(dropoff_datetime)
+	  or passenger_count < 1 or passenger_count > 6
+	  or trip_distance <=0 or trip_distance > 60
+	  or rate_code not in (1,2,3,4,5,6)
+	  or fare_charge < 0 or fare_charge > 1000
+	  or extra_charge < 0 
+	  or mta_tax_charge < 0 
+	  or tip_amount < 0
+	  or tolls_charge < 0
+	  or total_charge < 0
+group by vendorid;
+
+----- QUERY RESULT------|
+-- PROVIDER/|  COUNT     |
+   VENDOR   |            |  
+------------|------------|
+--   1      |  178013    | 
+------------|------------|       
+--   2      |   61220    |
+------------|------------|
+
+--BASED ON TOTAL RECORD COUNTS BY VENDOR AND CALCULATING PERCENTAGE OF BAD RECORDS,
+--VENDOR 1 HAS MORE BAD RECORDS THAN VENDOR 2
+
+--------------------------------------------------------------------------------------------------------------
+--                                   DATA PARTITIONING AND ANALYSIS                                          -
+--------------------------------------------------------------------------------------------------------------
+
+SET hive.exec.dynamic.partition = true;
+SET hive.exec.dynamic.partition.mode = nonstrict;
+SET hive.exec.max.dynamic.partitions = 1000;
+SET hive.exec.max.dynamic.partitions.pernode = 1000;
+SET hive.execution.engine=mr;
+
+---CREATE TABLE TO HOUSE PARTITIONED DATA
+
+CREATE EXTERNAL TABLE IF NOT EXISTS rk_nyc_taxi_partitioned(vendorid int, pickup_datetime string, dropoff_datetime string,
+passenger_count int, trip_distance double,rate_code int, store_forward_flag string, pickup_location int, dropoff_location int,
+payment_type int, fare_charge double, extra_charge double, mta_tax_charge double, tip_amount double, tolls_charge double,
+improvement_surcharge double, total_charge double) PARTITIONED BY (mth int, mday int)
+STORED AS orc
+LOCATION '/user/hive/warehouse/rupakadambi_gmail'
+tblproperties ("orc.compress"="SNAPPY");
+
+
+----INSERT DATA INTO THE PARTITIONED TABLE, EXCLUDING BAD RECORDS
+
+INSERT OVERWRITE TABLE rk_nyc_taxi_partitioned partition(yr, mnth)
+select vendorid, pickup_datetime, dropoff_datetime, passenger_count, trip_distance, rate_code, store_forward_flag,
+pickup_location, dropoff_location, payment_type, fare_charge, extra_charge, mta_tax_charge, tip_amount, tolls_charge,
+improvement_surcharge, total_charge, year(pickup_datetime)as yr, month(pickup_datetime)as mnth
+from rkad_nyc_taxi_rawdata
+where (year(dropoff_datetime) = 2017 and month(dropoff_datetime)  in (11,12)) 
+      and (year(pickup_datetime) = 2017 and month(pickup_datetime)  in (11,12))
+	  and unix_timestamp(pickup_datetime) < unix_timestamp(dropoff_datetime)
+	  and passenger_count >= 1 and passenger_count <= 6
+	  and trip_distance > 0 and trip_distance <= 60
+	  and rate_code in (1,2,3,4,5,6)
+	  and fare_charge >= 0 and fare_charge <= 1000
+	  and extra_charge >= 0 
+	  and mta_tax_charge >= 0 
+	  and tip_amount >= 0
+	  and tolls_charge >= 0
+	  and total_charge >= 0;
+	  
+select count(*) from  rk_nyc_taxi_partitioned;
+
+-----------------------------------------------ANALYSIS I ----------------------------------------------------------
+
+-----1. COMPARE OVERALL AVERAGE FARE PER TRIP FOR NOVEMBER AND DECEMBER
+
+select mnth, round(avg(fare_charge),2) as avg_fare_price
+from  rk_nyc_taxi_partitioned
+group by mnth
+order by mnth;
+
+
+------ QUERY RESULT------|
+-- MONTH    |  AVG FARE  |
+------------|------------|
+--   11     |  13.05     | 
+------------|------------|       
+--   12     |   12.84    |
+------------|------------|
+
+--NOVEMBER HAS SLIGHTLY HIGHER (1.6%) AVERAGE FARE PRICE THAN DECEMBER
+
+-----2. a) EXPLORE NO. OF PASSENGERS BY TRIP.
+
+select mnth, round(avg(fare_charge),2) as avg_fare_price
+from  rk_nyc_taxi_partitioned
+group by mnth
+order by mnth;
+
+----------- QUERY RESULT----------|
+-- PASSENGERS    |  NBR OF TRIPS  |
+-----------------|----------------|
+--   1           |  13149639      |
+-----------------|----------------|       
+--   2           |   2799837      |
+-----------------|----------------|
+--   3           |    806659      |
+-----------------|----------------|       
+--   4           |     39610      |
+-----------------|----------------|
+--   5           |    871861      |
+-----------------|----------------|       
+--   6           |    529240      |
+-----------------|----------------|
+
+-----2. b) COMPARE SOLO PASSENGER COUNT WITH THE REST
+
+SELECT sum(if( passenger_count = 1, 1, 0))as solo_trips, 
+sum(if(passenger_count > 1,1,0))as group_trips,
+count(*) as total_trips
+from rk_nyc_taxi_partitioned;
+
+SELECT round((sum(if( passenger_count = 1, 1, 0))/count(*))*100,3) as percent_solo_trips
+from rk_nyc_taxi_partitioned;
+
+----------- QUERY RESULT----------|--------------|
+-- SOLO TRIPS    |  GROUP TRIPS   |  TOTAL TRIPS |
+-----------------|----------------|--------------|
+--  13149639     |  5404207       |  18553846    |
+-----------------|----------------|--------------|
+
+-CALCULATING PERCENTAGE OF TOTAL TRIPS, SOLO TRIPS IS 70.87% OF TOTAL TRIPS. SO PASSENGERS PREFER TO TRAVEL SOLO
+
+
+------3. DETERMINE THE MOST PREFERRED MODE OF PAYMENT
+
+select payment_type , count(*) as nbr_trips
+from  rk_nyc_taxi_partitioned
+group by payment_type
+order by nbr_trips desc;
+
+----------- QUERY RESULT----------|
+-- PAYMENT TYPE  |  NBR OF TRIPS  |
+-----------------|----------------|
+--   1           |    12516879    |
+-----------------|----------------|       
+--   2           |     5937613    |
+-----------------|----------------|
+--   3           |       77649    |
+-----------------|----------------|       
+--   4           |       21705    |
+-----------------|----------------|
+
+--CLEARLY THE MOST POPULAR PAYMENT METHOD IS 1, WHICH IS CREDIT CARD, PER THE DATA DICTIONARY
+
+
+------4. DETERMINE AVERAGE TIP PAID PER TRIP
+
+select round(avg(tip_amount),2) as Average_Tip, round(percentile_approx(tip_amount,0.25),2)as 25th_percentile, 
+round(percentile_approx(tip_amount, 0.50),2)as 50th_percentile, 
+round(percentile_approx(tip_amount, 0.75),2)as 75th_Percentile
+from rk_nyc_taxi_partitioned
+where payment_type != 2;
+
+-------------------- QUERY RESULT--------------------|
+-- AVG TIP    |  25TH %ILE  | 50TH %ILE  | 75TH %ILE |
+--------------|-------------|------------|-----------|
+-- 2.71       |    1.34     |   2.0      |   3.06    |
+--------------|-------------|------------|-----------|
+
+--THERE IS A DIFFERENCE OF 0.7 B/W ACTUAL AVG AND 10TH PERCENTILE. AVERAGE TIP IS NOT REPRESENTATIVE STATISTIC OF
+--TIP AMOUNT PAID
+
+------5. EXPLORE THE EXTRA CHARGE VARIABLE
+
+SELECT sum(if (extra_charge > 0,1,0))as extra_charge_trips, count(*)as total_trips,
+round((sum(if (extra_charge > 0,1,0))/count(*))*100,2) as percent_extra_charge_trips
+from rk_nyc_taxi_partitioned;
+
+
+--------------------- QUERY RESULT--------------------------|
+-- EXTRA CHG TRIPS    |  TOTAL TRIPS   |  % EXTRA CHR TRIPS |
+----------------------|----------------|--------------------|
+--     8595324        |   18553846     |       46.33        |
+----------------------|----------------|--------------------|
+
+
+-----------------------------------------------ANALYSIS II----------------------------------------------------------
+
+------1. FIND THE CORRELATION BETWEEN NBR OF PASSENGERS & TIP PAID
+
+select round(corr(passenger_count, tip_amount),3)as correlation
+from rk_nyc_taxi_partitioned
+where payment_type != 2;
+
+-----RESULTS INDICATE A CORRELATION OF 0.01, WHICH IS VERY LOW
+
+
+------2. CALCULATE THE PERCENT SHARE FOR 5 SEGMENTS OF TIPS
+
+select tip_range, count(*)as nbr_trips, max(trips)as total_trips, 
+round((count(*)/max(trips))*100,3)as pct_share
+from (select nytaxi.*, count(*) over () trips,
+	CASE when tip_amount >= 0 and tip_amount <5 then 'TIPS LT 5' 
+	when tip_amount >=5 and tip_amount < 10 then 'TIPS 5-10'
+	when tip_amount >=10 and tip_amount < 15 then 'TIPS 10-15'
+	when tip_amount >=15 and tip_amount < 20 then 'TIPS 15-20'
+	else 'TIPS GE 20' 
+	end as tip_range 
+    from rk_nyc_taxi_partitioned nytaxi)as sub_q
+group by tip_range
+order by pct_share desc;
+
+--------------------- QUERY RESULT--------------------------|
+--tip_range	  |nbr_trips	|total_trips	|   pct_share   |
+--TIPS LT 5   |	17107605	| 18553846	    |    92.205     |
+--TIPS 5-10   |	1046583	    |18553846		|     5.641     |
+--TIPS 10-15  |	340221	    |18553846		|     1.834     |
+--TIPS 15-20  |	42351	    |18553846		|     0.228     |
+--TIPS GE 20  |	17086	    |18553846		|     0.092     |
+-------------------------------------------------------------
+--  CLEARLY TIPS LESS THAN 5 IS THE MOST COMMON 
+
+
+------3. DETERMINE WHICH MONTH HAS GREATER AVERAGE SPEED
+
+SELECT round(avg(CASE when mnth=11 THEN 
+(trip_distance/((unix_timestamp(dropoff_datetime)-unix_timestamp(pickup_datetime))/3600)) ELSE null end),3)
+as avg_speed_nov,
+round(avg(CASE when mnth=12 THEN (trip_distance/((unix_timestamp(dropoff_datetime)-unix_timestamp(pickup_datetime))/3600))
+ELSE null end),3)as avg_speed_dec
+from rk_nyc_taxi_partitioned;
+
+---------------------QUERY RESULT-----------------------------
+--AVG SPEED NOVEMBER : 12.798
+--AVG SPEED DECEMBER : 12.729
+--DIFFERENCE         : 0.069
+
+-- NOVEMBER AVERAGE SPEED IS SLIGHTLY HIGHER THAN DECEMBER
+
+
+------4. DETERMINE AVERAGE SPEED ON NEW YEARS EVE AND CHRISTMAS
+
+SELECT round(avg(CASE when mnth=12 and day(pickup_datetime) = 25 THEN 
+(trip_distance/((unix_timestamp(dropoff_datetime)-unix_timestamp(pickup_datetime))/3600)) ELSE null end),3)
+as avg_speed_christmas,
+round(avg(CASE when mnth=12 and day(pickup_datetime) = 31 THEN (trip_distance/((unix_timestamp(dropoff_datetime)-unix_timestamp(pickup_datetime))/3600))
+ELSE null end),3)as avg_speed_nye,
+round(avg(trip_distance/((unix_timestamp(dropoff_datetime)-unix_timestamp(pickup_datetime))/3600)),3)as avg_speed_total
+from rk_nyc_taxi_partitioned;
+
+---------------------QUERY RESULT-----------------------------
+--AVG SPEED CHRISTMAS : 16.859
+--AVG SPEED NYE       : 14.098
+--AVG SPEED OVERALL   : 12.763
+-------------------------------------------------------------
+-- AVERAGE SPEEDS ARE HIGHER DURING HOLIDAYS THAN DURING NORMAL DAYS
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
